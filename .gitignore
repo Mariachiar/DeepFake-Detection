@@ -1,0 +1,7 @@
+*.mp4
+*.csv
+*.png
+output_*/
+.vscode/
+__pycache__/
+*.pth
