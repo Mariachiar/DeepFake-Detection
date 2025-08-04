@@ -72,7 +72,7 @@ backend_target_pairs = [
 
 # --- Argument Parser ---
 parser = argparse.ArgumentParser(description="Real-time Multi-person Deepfake Preprocessing Pipeline")
-parser.add_argument('--model', '-m', type=str, default='C:\\Users\\maria\\Desktop\\deepfake\\preprocessing\\yunet\\face_detection_yunet_2023mar.onnx', help='Path to the YuNet ONNX model for face detection.')
+parser.add_argument('--model', '-m', type=str, default='.\\yunet\\face_detection_yunet_2023mar.onnx', help='Path to the YuNet ONNX model for face detection.')
 parser.add_argument('--backend_target', '-bt', type=int, default=0, help='Backend and target for YuNet. 0: OpenCV-CPU (default), 1: CUDA-GPU.')
 parser.add_argument('--mode', type=str, choices=['save', 'memory'], default='save', help='Clip handling mode: "save" to disk, "memory" to keep in RAM.')
 parser.add_argument('--vis', '-v', action='store_true', help='Enable real-time visualization with bounding boxes, IDs, landmarks, and FPS.')
