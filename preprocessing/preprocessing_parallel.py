@@ -22,8 +22,7 @@ from mediapipe.framework.formats import landmark_pb2
 import atexit
 
 from tqdm import tqdm
-
-
+import queue
 from concurrent.futures import ThreadPoolExecutor
 
 # Flag di uscita
@@ -99,6 +98,9 @@ LAND_CLIP_STEP = 4
 OUTPUT_BASE_DIR = "./datasets/processed_dataset"
 os.makedirs(OUTPUT_BASE_DIR, exist_ok=True)
 
+AU_SKIP_FRAMES = 2  # Esegui AU extraction ogni 2 frame per track_id
+DETECTION_SKIP_FRAMES = 2  # Esegui YuNet ogni 2 frame
+
 backend_target_pairs = [
     [cv2.dnn.DNN_BACKEND_OPENCV, cv2.dnn.DNN_TARGET_CPU],
     [cv2.dnn.DNN_BACKEND_CUDA, cv2.dnn.DNN_TARGET_CUDA]
@@ -116,6 +118,7 @@ parser.add_argument('--yunet_res', type=int, default=0, help='Shortest side reso
 parser.add_argument('--input', '-i', type=str, default='0', help="Path to video file or folder. '0' for webcam.")
 parser.add_argument('--headless', action='store_true', help='Disable all visualizations and plots (for headless/Docker environments).')
 parser.add_argument('--output', type=str, default=None, help="Path to save output video. If not set, no video will be saved.")
+parser.add_argument('--frame_skip', type=int, default=1, help='Process every N-th frame only')
 args = parser.parse_args()
 
 # --- Global Data Structures ---
@@ -125,6 +128,70 @@ all_clip_logs = [] # Aggregates clip metadata from all videos
 # --- Thread-local storage for MediaPipe instances ---
 thread_local_storage = threading.local()
 
+# Vicino alle altre strutture dati globali
+clip_writer_queue = queue.Queue()
+stop_writer_thread = threading.Event()
+
+def writer_worker(base_output_dir, input_base):
+    """Worker che preleva clip dalla coda e li salva su disco."""
+    global global_clip_index
+    print("[INFO] Thread Writer avviato.")
+    while not stop_writer_thread.is_set() or not clip_writer_queue.empty():
+        try:
+            # Attende un clip per un massimo di 1 secondo
+            clip_task = clip_writer_queue.get(timeout=1)
+            if clip_task is None: # Segnale di terminazione
+                continue
+
+            # Unpack dei dati
+            (source_name, track_id, clip_idx, img_clip_data, 
+             landmarks_clip_data, aus_clip_data, frame_start_id, 
+             frame_end_id, full_video_path) = clip_task
+
+            # --- Logica di salvataggio (spostata da save_clip_data) ---
+            if full_video_path and input_base:
+                relative_path = os.path.relpath(full_video_path, input_base)
+                relative_path_no_ext = os.path.splitext(relative_path)[0]
+                track_output_dir = os.path.join(base_output_dir, relative_path_no_ext, f"track_{track_id}")
+            else:
+                source_name_no_ext = os.path.splitext(source_name)[0]
+                track_output_dir = os.path.join(base_output_dir, source_name_no_ext, f"track_{track_id}")
+
+            clip_output_dir = os.path.join(track_output_dir, f"clip_{clip_idx:05d}")
+            os.makedirs(clip_output_dir, exist_ok=True)
+
+            np.save(os.path.join(clip_output_dir, "images.npy"), img_clip_data)
+            torch.save(
+                torch.tensor(img_clip_data, dtype=torch.float32).permute(0, 3, 1, 2) / 255.0,
+                os.path.join(clip_output_dir, "images.pt")
+            )
+            serializable_landmarks = []
+            for frame_landmarks in landmarks_clip_data:
+                if frame_landmarks:
+                    serializable_landmarks.append([{"x": lm.x, "y": lm.y, "z": lm.z} for lm in frame_landmarks.landmark])
+                else:
+                    serializable_landmarks.append([])
+            np.save(os.path.join(clip_output_dir, "landmarks.npy"), np.array(serializable_landmarks, dtype=object))
+            np.save(os.path.join(clip_output_dir, "aus.npy"), np.array(aus_clip_data, dtype=object))
+            
+            # Creazione del log
+            log_entry = {
+                "global_clip_id": global_clip_index,
+                "source_name": os.path.splitext(source_name)[0],
+                "track_id": track_id,
+                "clip_idx_in_track": clip_idx,
+                "clip_path": os.path.relpath(clip_output_dir, base_output_dir),
+                "frame_start_id": frame_start_id,
+                "frame_end_id": frame_end_id,
+                # ... altri campi del log
+            }
+            all_clip_logs.append(log_entry)
+            global_clip_index += 1
+            clip_writer_queue.task_done()
+
+        except queue.Empty:
+            continue # Continua il loop per ricontrollare stop_writer_thread
+    print("[INFO] Thread Writer terminato.")
 
 def _get_face_mesh_detector():
     """Gets or creates a FaceMesh instance for the current thread."""
@@ -161,11 +228,11 @@ def _process_face_mesh_for_thread(face_rgb_input):
     return landmarks, processing_time
 
 
-def save_clip_data(base_output_dir, source_name, track_id, clip_idx,
+"""def save_clip_data(base_output_dir, source_name, track_id, clip_idx,
                    img_clip_data, landmarks_clip_data, aus_clip_data,
                    frame_start_id, frame_end_id,
                    full_video_path=None, input_base=None):
-    """Saves a single clip of images, landmarks, and AUs to disk, preserving subfolder structure."""
+    Saves a single clip of images, landmarks, and AUs to disk, preserving subfolder structure.
     global global_clip_index
 
     # Determina il path di output: struttura replicata oppure fallback
@@ -216,7 +283,7 @@ def save_clip_data(base_output_dir, source_name, track_id, clip_idx,
     }
 
     global_clip_index += 1
-    return log_entry
+    return log_entry"""
 
 
 def detect_and_track(frame, face_detector, tracker, yunet_input_size, frame_log):
@@ -340,20 +407,21 @@ def handle_clip_buffers(result, clip_buffer, au_buffer, land_buffer, frame_id, c
             images_tensor = torch.tensor(clip_data, dtype=torch.float32).permute(0, 3, 1, 2) / 255.0
             # Further processing for AU/Landmark tensors can be done here if needed
             clips_in_ram.append({"track_id": track_id, "images": images_tensor})
-
+        # Dentro handle_clip_buffers, al posto della chiamata a save_clip_data
         elif args.mode == "save":
             track_clip_counters.setdefault(track_id, 0)
             clip_idx = track_clip_counters[track_id]
             
-            log_entry = save_clip_data(
-                OUTPUT_BASE_DIR, current_source_name, track_id, clip_idx,
+            # Prepara i dati per il thread writer
+            clip_task = (
+                current_source_name, track_id, clip_idx,
                 clip_data, land_sequence, au_sequence,
                 frame_id - CLIP_LENGTH + 1, frame_id,
-                full_video_path=video_path,  # nuovo argomento
-                input_base=args.input         # nuova base da cui calcolare il path relativo
+                video_path # Passa il percorso completo del video
             )
+            # Metti il task nella coda invece di bloccare il ciclo
+            clip_writer_queue.put(clip_task)
 
-            video_clip_logs.append(log_entry)
             track_clip_counters[track_id] += 1
 
         # Slide the buffers
@@ -452,6 +520,9 @@ def cleanup():
     if "executor" in globals() and executor is not None:
         try:
             executor.shutdown(wait=True)
+            stop_writer_thread.set()
+            clip_writer_queue.join() # Attende che la coda sia vuota
+            writer_thread.join() # Attende che il thread termini
         except Exception as e:
             print(f"[WARN] Errore durante lo shutdown del thread pool: {e}")
 
@@ -462,7 +533,7 @@ def cleanup():
         clips_df.to_csv(master_log_path, index=False)
         print(f"✅ Master clip log with {len(clips_df)} entries saved to: {master_log_path}")
 
-    if all_pipeline_logs and not args.headless:
+    if all_pipeline_logs:
         log_df = pd.DataFrame(all_pipeline_logs)
         log_df_path = "pipeline_performance_log.csv"
         log_df.to_csv(log_df_path, index=False)
@@ -543,6 +614,9 @@ if __name__ == "__main__" :
 
     threading.Thread(target=esc_listener, daemon=True).start()
 
+    writer_thread = threading.Thread(target=writer_worker, args=(OUTPUT_BASE_DIR, args.input), daemon=True)
+    writer_thread.start()
+
     if not args.headless:
     # --- Preparazione interfaccia di caricamento ---
         cv2.namedWindow("Tracking & Facial Analysis", cv2.WINDOW_NORMAL)
@@ -593,9 +667,26 @@ if __name__ == "__main__" :
             w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             video_writer = None
             if args.output:
-                out_path = args.output
-                video_writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*'mp4v'), 15.0, (w, h))
-                print(f"[INFO] Output video will be saved to: {out_path}")
+                # Se è una directory, genera un filename valido
+                if os.path.isdir(args.output) or not os.path.splitext(args.output)[1]:
+                    os.makedirs(args.output, exist_ok=True)
+                    output_filename = os.path.splitext(source_name)[0] + "_processed.mp4"
+                    output_path = os.path.join(args.output, output_filename)
+                else:
+                    output_path = args.output
+                    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+                # Verifica finale: estensione corretta
+                if not output_path.lower().endswith(('.mp4', '.avi')):
+                    print(f"[ERROR] Il file di output deve avere estensione .mp4 o .avi. Ricevuto: {output_path}")
+                    sys.exit(1)
+
+                # Creazione del writer
+                video_writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), 15.0, (w, h))
+                if not video_writer.isOpened():
+                    print(f"[ERROR] Impossibile creare VideoWriter per il path: {output_path}")
+                    sys.exit(1)
+                print(f"[INFO] Output video will be saved to: {output_path}")
             else:
                 print(f"[INFO] Output video will NOT be saved.")
 
@@ -616,6 +707,8 @@ if __name__ == "__main__" :
             track_clip_counters = {}
             pipeline_logs_for_this_video, video_clip_logs, clips_in_ram = [], [], []
 
+
+
             # Tentativo di calcolo del numero totale di frame (può fallire in streaming)
             try:
                 total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -635,8 +728,14 @@ if __name__ == "__main__" :
 
                     start_read_time = time.time()
                     ret, frame = cap.read() 
-                    if not ret: break
+                    if not ret:
+                        break
                     frame_log["read_frame_time"] = time.time() - start_read_time
+
+                    if frame_id % args.frame_skip != 0:
+                        frame_id += 1
+                        continue
+
 
                     online_targets, img_h, img_w = detect_and_track(frame, face_detector, tracker, yunet_input_size, frame_log)
                     preprocessed_faces, au_map = preprocess_and_extract_features(frame, online_targets, frame_log)
@@ -669,8 +768,6 @@ if __name__ == "__main__" :
                     frame_log["drawing_time"] = time.time() - start_draw_time  
                     if video_writer:
                         video_writer.write(frame)
-        
-                    frame_id += 1
 
                     if progress_bar:
                         progress_bar.update(1)
