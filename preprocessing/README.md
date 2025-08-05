@@ -16,7 +16,8 @@ Aprire un terminale nella cartella del progetto ed eseguire il seguente comando:
 
 ## Esempio
 
-python ./preprocessing/preprocessing_parallel.py --input PATH_INPUT_VIDEO_O_CARTELLA --model preprocessing/yunet/face_detection_yunet_2023mar.onnx --mode save --vis --num_workers_per_frame 4
+python ./preprocessing/preprocessing_parallel.py --input PATH --model preprocessing/yunet/face_detection_yunet_2023mar.onnx --mode save --vis --num_workers_per_frame 4 --output output.mp4
+
 
 
 > Se vuoi usare la webcam in tempo reale, usa `--input 0`.
@@ -33,6 +34,10 @@ python ./preprocessing/preprocessing_parallel.py --input PATH_INPUT_VIDEO_O_CART
 | `--num_workers_per_frame`     | Numero di thread per frame (parallelismo MediaPipe)                        |
 | `--show_faces`                | Mostra finestre separate con le facce ritagliate                           |
 | `--yunet_res`                 | Risoluzione min. per YuNet (es. 320). 0 = usa risoluzione originale        |
+| `--output`                    | Percorso per salvare il video con bounding box e landmark. Se omesso, non viene salvato. |
+
+⚠️ Nota: in modalità `--headless`, il salvataggio video con `--output` è supportato, ma le finestre grafiche (`--vis`, `--show_faces`) vengono ignorate.
+
 
 ## 📁 Output
 
