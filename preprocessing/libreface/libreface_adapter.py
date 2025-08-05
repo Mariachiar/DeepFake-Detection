@@ -60,8 +60,8 @@ def _initialize_au_model():
         try:
             _au_model_instance = solver_in_domain_image(config=au_config)
             _au_model_instance.load_best_ckpt()
-            print("LibreFace Adapter: Modello AU caricato con successo.")
-            print(f"LibreFace Adapter: Modello caricato su dispositivo: {_au_model_instance.device}")
+            #print("LibreFace Adapter: Modello AU caricato con successo.")
+            #print(f"LibreFace Adapter: Modello caricato su dispositivo: {_au_model_instance.device}")
             
             # Inizializza la trasformazione qui, dopo aver impostato il modello
             _au_transform = Compose([
@@ -122,7 +122,7 @@ def get_au_from_face_ndarray(face_batch: list[np.ndarray]) -> list[dict]:
     try:
         # Esegui l'inferenza in batch se il modello lo supporta
         # Se image_inference supporta batch, questa sarà più efficiente
-        print(f"DEBUG: Dimensioni batch_tensor = {batch_tensor.shape}")
+        #print(f"DEBUG: Dimensioni batch_tensor = {batch_tensor.shape}")
 
         batch_results_tensor = _au_model_instance.image_inference_batch(batch_tensor)
         

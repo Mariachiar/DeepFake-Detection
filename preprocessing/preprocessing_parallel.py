@@ -19,19 +19,54 @@ from preprocessing.ByteTrack.basetrack import BaseTrack
 
 import mediapipe as mp
 from mediapipe.framework.formats import landmark_pb2
+import atexit
+
+from tqdm import tqdm
+
 
 from concurrent.futures import ThreadPoolExecutor
 
-import keyboard
+# Flag di uscita
 
-# Interruption flag controllato da tastiera
+cleanup_called = threading.Event()
+
+import time
+
 esc_pressed = threading.Event()
 
 def esc_listener():
-    print("[INFO] Ascolto ESC attivo (anche in headless).")
-    keyboard.wait('esc')  # Bloccante finché non premi ESC
-    esc_pressed.set()
+    try:
+        import termios
+        import tty
+        import select
 
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+
+        try:
+            tty.setcbreak(fd)
+            while not esc_pressed.is_set():
+                if select.select([sys.stdin], [], [], 0.1)[0]:
+                    key = sys.stdin.read(1)
+                    if key == '\x1b':  # ESC
+                        print("\n[INFO] ESC premuto da tastiera.")
+                        esc_pressed.set()
+                        break
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    except (ImportError, AttributeError, OSError):
+        # Windows fallback: non-blocking keyboard listener
+        try:
+            import msvcrt
+            while not esc_pressed.is_set():
+                if msvcrt.kbhit() and msvcrt.getch() == b'\x1b':
+                    print("\n[INFO] ESC premuto da tastiera (Windows).")
+                    esc_pressed.set()
+                    break
+                time.sleep(0.1)
+        except ImportError:
+            print("[WARN] Nessun metodo disponibile per ascoltare ESC.")
 
 # --- LibreFace (AU Extraction) ---
 try:
@@ -64,7 +99,6 @@ LAND_CLIP_STEP = 4
 OUTPUT_BASE_DIR = "./datasets/processed_dataset"
 os.makedirs(OUTPUT_BASE_DIR, exist_ok=True)
 
-
 backend_target_pairs = [
     [cv2.dnn.DNN_BACKEND_OPENCV, cv2.dnn.DNN_TARGET_CPU],
     [cv2.dnn.DNN_BACKEND_CUDA, cv2.dnn.DNN_TARGET_CUDA]
@@ -72,7 +106,7 @@ backend_target_pairs = [
 
 # --- Argument Parser ---
 parser = argparse.ArgumentParser(description="Real-time Multi-person Deepfake Preprocessing Pipeline")
-parser.add_argument('--model', '-m', type=str, default='.\\yunet\\face_detection_yunet_2023mar.onnx', help='Path to the YuNet ONNX model for face detection.')
+parser.add_argument('--model', '-m', type=str, default=os.path.join('preprocessing', 'yunet', 'face_detection_yunet_2023mar.onnx'), help='Path to the YuNet ONNX model for face detection.')
 parser.add_argument('--backend_target', '-bt', type=int, default=0, help='Backend and target for YuNet. 0: OpenCV-CPU (default), 1: CUDA-GPU.')
 parser.add_argument('--mode', type=str, choices=['save', 'memory'], default='save', help='Clip handling mode: "save" to disk, "memory" to keep in RAM.')
 parser.add_argument('--vis', '-v', action='store_true', help='Enable real-time visualization with bounding boxes, IDs, landmarks, and FPS.')
@@ -81,6 +115,7 @@ parser.add_argument('--show_faces', action='store_true', help='Show separate win
 parser.add_argument('--yunet_res', type=int, default=0, help='Shortest side resolution for YuNet input resizing (e.g., 320). 0 for original frame resolution.')
 parser.add_argument('--input', '-i', type=str, default='0', help="Path to video file or folder. '0' for webcam.")
 parser.add_argument('--headless', action='store_true', help='Disable all visualizations and plots (for headless/Docker environments).')
+parser.add_argument('--output', type=str, default=None, help="Path to save output video. If not set, no video will be saved.")
 args = parser.parse_args()
 
 # --- Global Data Structures ---
@@ -90,7 +125,6 @@ all_clip_logs = [] # Aggregates clip metadata from all videos
 # --- Thread-local storage for MediaPipe instances ---
 thread_local_storage = threading.local()
 
-# --- TROVA E SOSTITUISCI QUESTA FUNZIONE ---
 
 def _get_face_mesh_detector():
     """Gets or creates a FaceMesh instance for the current thread."""
@@ -120,8 +154,8 @@ def _process_face_mesh_for_thread(face_rgb_input):
 
     if not results_mesh.multi_face_landmarks:
         print("[DEBUG] ⚠️ MediaPipe non ha rilevato nessun landmark per questa faccia.")
-    else:
-        print("[DEBUG] ✅ Landmark trovati.")
+    #else:
+        #print("[DEBUG] ✅ Landmark trovati.")
 
     landmarks = results_mesh.multi_face_landmarks[0] if results_mesh.multi_face_landmarks else None
     return landmarks, processing_time
@@ -409,9 +443,106 @@ def draw_visualizations(frame, tracked_faces, mesh_results, img_w, img_h, frame_
             cv2.imshow("Pipeline Status (Press ESC to exit)", status_frame)
 
 
+def cleanup():
+    if cleanup_called.is_set():
+        return
+    cleanup_called.set()
 
+    print("\n[INFO] Esecuzione cleanup finale...")
+    if "executor" in globals() and executor is not None:
+        try:
+            executor.shutdown(wait=True)
+        except Exception as e:
+            print(f"[WARN] Errore durante lo shutdown del thread pool: {e}")
+
+
+    if all_clip_logs:
+        clips_df = pd.DataFrame(all_clip_logs)
+        master_log_path = os.path.join(OUTPUT_BASE_DIR, "master_clip_log.csv")
+        clips_df.to_csv(master_log_path, index=False)
+        print(f"✅ Master clip log with {len(clips_df)} entries saved to: {master_log_path}")
+
+    if all_pipeline_logs and not args.headless:
+        log_df = pd.DataFrame(all_pipeline_logs)
+        log_df_path = "pipeline_performance_log.csv"
+        log_df.to_csv(log_df_path, index=False)
+        print(f"✅ Aggregated performance log for {len(log_df)} frames saved to: {log_df_path}")
+
+        plt.figure(figsize=(14, 7))
+        plt.plot(log_df.index, log_df["total_pipeline_fps"], label='Total Pipeline FPS', color='b', alpha=0.7)
+        plt.title("Overall Pipeline Performance (FPS) Across All Videos")
+        plt.xlabel("Frame Number (Overall)")
+        plt.ylabel("Frames Per Second (FPS)")
+        plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig("total_pipeline_fps.png")
+        plt.show()
+
+        plt.figure(figsize=(14, 9))
+        time_cols = ["read_frame_time", "yunet_inference_time", "bytetrack_update_time",
+                     "face_preprocessing_time", "au_extraction_time", 
+                     "mediapipe_parallel_wall_time", "clip_handling_time", "drawing_time"]
+        for col in time_cols:
+            if col in log_df.columns:
+                plt.plot(log_df.index, log_df[col], label=col.replace("_", " ").title())
+
+        plt.title("Execution Time per Pipeline Component (Seconds)")
+        plt.xlabel("Frame Number (Overall)")
+        plt.ylabel("Time (seconds)")
+        plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+        plt.legend(loc='upper left')
+        plt.tight_layout()
+        plt.savefig("time_per_component.png")
+        plt.show()
+
+    if not args.headless:
+        cv2.destroyAllWindows()
+    print("[INFO] Cleanup completato.")
+
+atexit.register(cleanup)
 
 if __name__ == "__main__" :
+
+    executor = None
+    all_pipeline_logs = []
+    all_clip_logs = []
+
+
+    # --- Input Source Identification ---
+    video_paths = []
+
+    # Caso webcam (solo se non headless)
+    if args.input == '0':
+        if args.headless:
+            print("[ERROR] In modalità headless non è possibile usare la webcam ('0' come input).")
+            sys.exit(1)
+        else:
+            video_paths = ['0']
+
+    # Caso singolo file
+    elif os.path.isfile(args.input):
+        video_paths = [args.input]
+
+    # Caso directory: cerca ricorsivamente video
+    elif os.path.isdir(args.input):
+        for root, dirs, files in os.walk(args.input):
+            for file in files:
+                if file.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
+                    full_path = os.path.join(root, file)
+                    video_paths.append(full_path)
+        if not video_paths:
+            print(f"[ERROR] Nessun video valido trovato ricorsivamente in '{args.input}'.")
+            sys.exit(1)
+
+    # Caso input non valido
+    else:
+        print(f"[ERROR] Il path fornito non è valido: '{args.input}'")
+        sys.exit(1)
+
+
+    threading.Thread(target=esc_listener, daemon=True).start()
+
     if not args.headless:
     # --- Preparazione interfaccia di caricamento ---
         cv2.namedWindow("Tracking & Facial Analysis", cv2.WINDOW_NORMAL)
@@ -419,16 +550,15 @@ if __name__ == "__main__" :
         cv2.putText(loading_img, "Loading models... Please wait.", (50, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         cv2.imshow("Tracking & Facial Analysis", loading_img)
         cv2.waitKey(1)
-    # Prima del ciclo while cap.isOpened()
-    esc_thread = threading.Thread(target=esc_listener, daemon=True)
-    esc_thread.start()
 
     if _libreface_available:
         try:
             libreface_init_au_model()
             print("LibreFace AU model loaded.")
-            print(f"[DEBUG] args.headless = {args.headless}")
-            print(f"[DEBUG] args.vis = {args.vis}")
+            #print(f"[DEBUG] args.headless = {args.headless}")
+            #print(f"[DEBUG] args.vis = {args.vis}")
+            #print(f"[DEBUG] args.backend_target = {args.backend_target}")
+
         except Exception as e:
             print(f"ERROR: Failed to initialize LibreFace AU model: {e}"); sys.exit(1)
 
@@ -439,23 +569,7 @@ if __name__ == "__main__" :
     mp_drawing_styles = mp.solutions.drawing_styles
     executor = ThreadPoolExecutor(max_workers=args.num_workers_per_frame)
 
-    # --- Input Source Identification ---
-    if args.input == '0': video_paths = ['0']
-    elif os.path.isfile(args.input): video_paths = [args.input]
-    elif os.path.isdir(args.input):
-        video_paths = []
-        for root, dirs, files in os.walk(args.input):
-            for file in files:
-                if file.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
-                    full_path = os.path.join(root, file)
-                    video_paths.append(full_path)
-
-        if not video_paths:
-            print(f"Error: No valid videos found recursively in '{args.input}'")
-            sys.exit(1)
-
-    # --- Global Log Aggregation ---
-    all_pipeline_logs = []
+    progress_bar = None
 
 
     try:
@@ -477,8 +591,14 @@ if __name__ == "__main__" :
 
             print(f"\n--- Processing: {source_name} ---")
             w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            out_path = f"output_{os.path.splitext(source_name)[0]}.mp4"
-            video_writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*'mp4v'), 15.0, (w, h))
+            video_writer = None
+            if args.output:
+                out_path = args.output
+                video_writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*'mp4v'), 15.0, (w, h))
+                print(f"[INFO] Output video will be saved to: {out_path}")
+            else:
+                print(f"[INFO] Output video will NOT be saved.")
+
 
             if args.yunet_res > 0:
                 aspect_ratio = w / h
@@ -496,14 +616,25 @@ if __name__ == "__main__" :
             track_clip_counters = {}
             pipeline_logs_for_this_video, video_clip_logs, clips_in_ram = [], [], []
 
+            # Tentativo di calcolo del numero totale di frame (può fallire in streaming)
+            try:
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                if total_frames > 0:
+                    progress_bar = tqdm(total=total_frames, desc=f"Processing {source_name}", unit="frame")
+                else:
+                    progress_bar = None
+            except:
+                progress_bar = None
+
+
             try:
                 while cap.isOpened():
+                    
                     start_total_frame_time = time.time()
                     frame_log = {"frame_id": frame_id, "source_name": source_name, "clip_handling_time": 0.0}
 
                     start_read_time = time.time()
-                    ret, frame = cap.read()
-                    print(ret)  
+                    ret, frame = cap.read() 
                     if not ret: break
                     frame_log["read_frame_time"] = time.time() - start_read_time
 
@@ -536,9 +667,14 @@ if __name__ == "__main__" :
                     start_draw_time = time.time()
                     draw_visualizations(frame, preprocessed_faces, completed_results, img_w, img_h, frame_log, frame_id) 
                     frame_log["drawing_time"] = time.time() - start_draw_time  
-                    video_writer.write(frame)
-                    
+                    if video_writer:
+                        video_writer.write(frame)
+        
                     frame_id += 1
+
+                    if progress_bar:
+                        progress_bar.update(1)
+
 
                     if esc_pressed.is_set():
                         raise InterruptedError("ESC pressed from keyboard input.")
@@ -547,9 +683,18 @@ if __name__ == "__main__" :
             except (KeyboardInterrupt, InterruptedError):
                 print("\nInterruption detected. Proceeding to cleanup and final report generation.")
             finally:
-                print(f"Finished processing '{source_name}'. Processed {frame_id} frames. Saved output to '{out_path}'")
+                if args.output:
+                    print(f"Finished processing '{source_name}'. Processed {frame_id} frames. Saved output to '{args.output}'")
+                else:
+                    print(f"Finished processing '{source_name}'. Processed {frame_id} frames.")
+
                 cap.release()
-                video_writer.release()
+
+                if progress_bar:
+                    progress_bar.close()
+
+                if video_writer:
+                    video_writer.release()
                 BaseTrack._count = 0
                 if not args.headless:
                     cv2.destroyAllWindows()
@@ -557,47 +702,4 @@ if __name__ == "__main__" :
                 all_clip_logs.extend(video_clip_logs)
     finally:
             # --- Final Cleanup and Reporting (after all videos) ---
-            print("\n[INFO] All videos processed. Shutting down thread pool and generating final reports...")
-            executor.shutdown(wait=True)
-
-            if all_clip_logs:
-                clips_df = pd.DataFrame(all_clip_logs)
-                master_log_path = os.path.join(OUTPUT_BASE_DIR, "master_clip_log.csv")
-                clips_df.to_csv(master_log_path, index=False)
-                print(f"✅ Master clip log with {len(clips_df)} entries saved to: {master_log_path}")
-
-            if all_pipeline_logs and not args.headless:
-                log_df = pd.DataFrame(all_pipeline_logs)
-                log_df_path = "pipeline_performance_log.csv"
-                log_df.to_csv(log_df_path, index=False)
-                print(f"✅ Aggregated performance log for {len(log_df)} frames saved to: {log_df_path}")
-
-                # Plotting total FPS
-                plt.figure(figsize=(14, 7))
-                plt.plot(log_df.index, log_df["total_pipeline_fps"], label='Total Pipeline FPS', color='b', alpha=0.7)
-                plt.title("Overall Pipeline Performance (FPS) Across All Videos")
-                plt.xlabel("Frame Number (Overall)")
-                plt.ylabel("Frames Per Second (FPS)")
-                plt.grid(True, which='both', linestyle='--', linewidth=0.5)
-                plt.legend()
-                plt.tight_layout()
-                plt.savefig("total_pipeline_fps.png"); plt.show()
-
-                # Plotting time spent per component
-                plt.figure(figsize=(14, 9))
-                time_cols = ["read_frame_time", "yunet_inference_time", "bytetrack_update_time",
-                            "face_preprocessing_time", "au_extraction_time", 
-                            "mediapipe_parallel_wall_time", "clip_handling_time", "drawing_time"]
-                for col in time_cols:
-                    if col in log_df.columns:
-                        plt.plot(log_df.index, log_df[col], label=col.replace("_", " ").title())
-                
-                plt.title("Execution Time per Pipeline Component (Seconds)")
-                plt.xlabel("Frame Number (Overall)")
-                plt.ylabel("Time (seconds)")
-                plt.grid(True, which='both', linestyle='--', linewidth=0.5)
-                plt.legend(loc='upper left')
-                plt.tight_layout()
-                plt.savefig("time_per_component.png"); plt.show()
-
-            print("\n[INFO] Pipeline finished successfully.")
+            cleanup()
