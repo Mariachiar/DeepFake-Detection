@@ -25,37 +25,30 @@ from tqdm import tqdm
 import queue
 from concurrent.futures import ThreadPoolExecutor
 
-# Flag di uscita
-
+# --- Flag di uscita ---
 cleanup_called = threading.Event()
-
-import time
-
 esc_pressed = threading.Event()
+
+# --- CODA E GESTIONE THREAD SCRITTURA ---
+clip_writer_queue = queue.Queue()
+stop_writer_thread = threading.Event()
 
 def esc_listener():
     try:
-        import termios
-        import tty
-        import select
-
+        import termios, tty, select
         fd = sys.stdin.fileno()
         old_settings = termios.tcgetattr(fd)
-
         try:
             tty.setcbreak(fd)
             while not esc_pressed.is_set():
                 if select.select([sys.stdin], [], [], 0.1)[0]:
-                    key = sys.stdin.read(1)
-                    if key == '\x1b':  # ESC
+                    if sys.stdin.read(1) == '\x1b':
                         print("\n[INFO] ESC premuto da tastiera.")
                         esc_pressed.set()
                         break
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-
     except (ImportError, AttributeError, OSError):
-        # Windows fallback: non-blocking keyboard listener
         try:
             import msvcrt
             while not esc_pressed.is_set():
@@ -67,24 +60,17 @@ def esc_listener():
         except ImportError:
             print("[WARN] Nessun metodo disponibile per ascoltare ESC.")
 
+
 # --- LibreFace (AU Extraction) ---
 try:
     from preprocessing.libreface.libreface_adapter import get_au_from_face_ndarray, _initialize_au_model as libreface_init_au_model
     print("LibreFace imported successfully for AU extraction.")
     _libreface_available = True
 except ImportError:
-    print("WARNING: LibreFace not found.")
-    print(torch.cuda.is_available())
-    print(torch.cuda.get_device_name(0))
-    print("Using a placeholder function for AU extraction (batch simulation).")
+    print("WARNING: LibreFace not found. Using a placeholder function for AU extraction.")
     def get_au_from_face_ndarray(face_rgbs_batch):
         time.sleep(0.005 * len(face_rgbs_batch))
-        return [{
-            "AU01": np.random.rand(), "AU02": np.random.rand(), "AU04": np.random.rand(),
-            "AU06": np.random.rand(), "AU07": np.random.rand(), "AU10": np.random.rand(),
-            "AU12": np.random.rand(), "AU14": np.random.rand(), "AU15": np.random.rand(),
-            "AU17": np.random.rand(), "AU23": np.random.rand(), "AU24": np.random.rand()
-        } for _ in face_rgbs_batch]
+        return [{"AU{:02d}".format(i): np.random.rand() for i in [1, 2, 4, 6, 7, 10, 12, 14, 15, 17, 23, 24]} for _ in face_rgbs_batch]
     _libreface_available = False
 
 # --- Constants ---
@@ -98,8 +84,8 @@ LAND_CLIP_STEP = 4
 OUTPUT_BASE_DIR = "./datasets/processed_dataset"
 os.makedirs(OUTPUT_BASE_DIR, exist_ok=True)
 
-AU_SKIP_FRAMES = 2  # Esegui AU extraction ogni 2 frame per track_id
-DETECTION_SKIP_FRAMES = 2  # Esegui YuNet ogni 2 frame
+# --- NUOVA COSTANTE PER OTTIMIZZAZIONE ---
+FEATURE_EXTRACTION_SKIP = 2  # Esegui AU/MediaPipe solo 1 frame ogni 2 per ogni track_id
 
 backend_target_pairs = [
     [cv2.dnn.DNN_BACKEND_OPENCV, cv2.dnn.DNN_TARGET_CPU],
@@ -121,35 +107,28 @@ parser.add_argument('--output', type=str, default=None, help="Path to save outpu
 parser.add_argument('--frame_skip', type=int, default=1, help='Process every N-th frame only')
 args = parser.parse_args()
 
+
 # --- Global Data Structures ---
 global_clip_index = 0
-all_clip_logs = [] # Aggregates clip metadata from all videos
-
-# --- Thread-local storage for MediaPipe instances ---
+all_clip_logs = []
 thread_local_storage = threading.local()
-
-# Vicino alle altre strutture dati globali
-clip_writer_queue = queue.Queue()
-stop_writer_thread = threading.Event()
 
 def writer_worker(base_output_dir, input_base):
     """Worker che preleva clip dalla coda e li salva su disco."""
-    global global_clip_index
+    global global_clip_index, all_clip_logs
     print("[INFO] Thread Writer avviato.")
     while not stop_writer_thread.is_set() or not clip_writer_queue.empty():
         try:
-            # Attende un clip per un massimo di 1 secondo
             clip_task = clip_writer_queue.get(timeout=1)
-            if clip_task is None: # Segnale di terminazione
+            if clip_task is None:
                 continue
 
-            # Unpack dei dati
             (source_name, track_id, clip_idx, img_clip_data, 
              landmarks_clip_data, aus_clip_data, frame_start_id, 
              frame_end_id, full_video_path) = clip_task
-
-            # --- Logica di salvataggio (spostata da save_clip_data) ---
-            if full_video_path and input_base:
+            
+            # ... (logica di salvataggio invariata)
+            if full_video_path and input_base and os.path.isdir(input_base):
                 relative_path = os.path.relpath(full_video_path, input_base)
                 relative_path_no_ext = os.path.splitext(relative_path)[0]
                 track_output_dir = os.path.join(base_output_dir, relative_path_no_ext, f"track_{track_id}")
@@ -174,117 +153,39 @@ def writer_worker(base_output_dir, input_base):
             np.save(os.path.join(clip_output_dir, "landmarks.npy"), np.array(serializable_landmarks, dtype=object))
             np.save(os.path.join(clip_output_dir, "aus.npy"), np.array(aus_clip_data, dtype=object))
             
-            # Creazione del log
             log_entry = {
-                "global_clip_id": global_clip_index,
-                "source_name": os.path.splitext(source_name)[0],
-                "track_id": track_id,
-                "clip_idx_in_track": clip_idx,
+                "global_clip_id": global_clip_index, "source_name": os.path.splitext(source_name)[0],
+                "track_id": track_id, "clip_idx_in_track": clip_idx,
                 "clip_path": os.path.relpath(clip_output_dir, base_output_dir),
-                "frame_start_id": frame_start_id,
-                "frame_end_id": frame_end_id,
-                # ... altri campi del log
+                "frame_start_id": frame_start_id, "frame_end_id": frame_end_id,
+                "clip_length_frames": CLIP_LENGTH, "clip_size_pixels": f"{CLIP_SIZE[0]}x{CLIP_SIZE[1]}"
             }
             all_clip_logs.append(log_entry)
             global_clip_index += 1
             clip_writer_queue.task_done()
 
         except queue.Empty:
-            continue # Continua il loop per ricontrollare stop_writer_thread
+            continue
     print("[INFO] Thread Writer terminato.")
+
 
 def _get_face_mesh_detector():
     """Gets or creates a FaceMesh instance for the current thread."""
     if not hasattr(thread_local_storage, 'face_mesh_detector'):
-        #if not args.headless:
         print(f"Initializing MediaPipe FaceMesh for thread {threading.get_ident()}...")
-        
-        # --- Modifica qui ---
-        # Ripristiniamo le impostazioni originali che sono più robuste
         thread_local_storage.face_mesh_detector = mp.solutions.face_mesh.FaceMesh(
-            static_image_mode=False,         # <-- RIPORTATO A False
-            max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5      # <-- REINSERITO
-        )
-        # --- Fine modifica ---
-        
+            static_image_mode=False, max_num_faces=1, refine_landmarks=True,
+            min_detection_confidence=0.5, min_tracking_confidence=0.5)
     return thread_local_storage.face_mesh_detector
 
 def _process_face_mesh_for_thread(face_rgb_input):
+    # ... (invariata)
     face_mesh_detector_instance = _get_face_mesh_detector()
-
     start_time = time.time()
     results_mesh = face_mesh_detector_instance.process(face_rgb_input)
     processing_time = time.time() - start_time
-
-    if not results_mesh.multi_face_landmarks:
-        print("[DEBUG] ⚠️ MediaPipe non ha rilevato nessun landmark per questa faccia.")
-    #else:
-        #print("[DEBUG] ✅ Landmark trovati.")
-
     landmarks = results_mesh.multi_face_landmarks[0] if results_mesh.multi_face_landmarks else None
     return landmarks, processing_time
-
-
-"""def save_clip_data(base_output_dir, source_name, track_id, clip_idx,
-                   img_clip_data, landmarks_clip_data, aus_clip_data,
-                   frame_start_id, frame_end_id,
-                   full_video_path=None, input_base=None):
-    Saves a single clip of images, landmarks, and AUs to disk, preserving subfolder structure.
-    global global_clip_index
-
-    # Determina il path di output: struttura replicata oppure fallback
-    if full_video_path and input_base:
-        relative_path = os.path.relpath(full_video_path, input_base)
-        relative_path_no_ext = os.path.splitext(relative_path)[0]
-        track_output_dir = os.path.join(base_output_dir, relative_path_no_ext, f"track_{track_id}")
-    else:
-        source_name_no_ext = os.path.splitext(source_name)[0]
-        track_output_dir = os.path.join(base_output_dir, source_name_no_ext, f"track_{track_id}")
-
-    clip_output_dir = os.path.join(track_output_dir, f"clip_{clip_idx:05d}")
-    os.makedirs(clip_output_dir, exist_ok=True)
-
-    # --- Salvataggio immagini ---
-    np.save(os.path.join(clip_output_dir, "images.npy"), img_clip_data)
-    torch.save(
-        torch.tensor(img_clip_data, dtype=torch.float32).permute(0, 3, 1, 2) / 255.0,
-        os.path.join(clip_output_dir, "images.pt")
-    )
-
-    # --- Salvataggio landmarks ---
-    serializable_landmarks = []
-    for frame_landmarks in landmarks_clip_data:
-        if frame_landmarks:
-            serializable_landmarks.append(
-                [{"x": lm.x, "y": lm.y, "z": lm.z} for lm in frame_landmarks.landmark]
-            )
-        else:
-            serializable_landmarks.append([])  # Frame senza landmark
-
-    np.save(os.path.join(clip_output_dir, "landmarks.npy"), np.array(serializable_landmarks, dtype=object))
-
-    # --- Salvataggio AUs ---
-    np.save(os.path.join(clip_output_dir, "aus.npy"), np.array(aus_clip_data, dtype=object))
-
-    # --- Log ---
-    log_entry = {
-        "global_clip_id": global_clip_index,
-        "source_name": os.path.splitext(source_name)[0],
-        "track_id": track_id,
-        "clip_idx_in_track": clip_idx,
-        "clip_path": os.path.relpath(clip_output_dir, base_output_dir),
-        "frame_start_id": frame_start_id,
-        "frame_end_id": frame_end_id,
-        "clip_length_frames": CLIP_LENGTH,
-        "clip_size_pixels": f"{CLIP_SIZE[0]}x{CLIP_SIZE[1]}"
-    }
-
-    global_clip_index += 1
-    return log_entry"""
-
 
 def detect_and_track(frame, face_detector, tracker, yunet_input_size, frame_log):
     """Performs face detection (YuNet) and tracking (ByteTrack)."""
@@ -292,7 +193,7 @@ def detect_and_track(frame, face_detector, tracker, yunet_input_size, frame_log)
     frame_for_yunet = frame
     if yunet_input_size != [w, h]:
         frame_for_yunet = cv2.resize(frame, (yunet_input_size[0], yunet_input_size[1]))
-
+    
     start_time = time.time()
     detections = face_detector.infer(frame_for_yunet)
     frame_log["yunet_inference_time"] = time.time() - start_time
@@ -310,47 +211,55 @@ def detect_and_track(frame, face_detector, tracker, yunet_input_size, frame_log)
 
     return online_targets, h, w
 
-def preprocess_and_extract_features(frame, online_targets, frame_log):
-    """Crops faces, resizes them, and extracts Action Units (AUs)."""
+# --- FUNZIONE MODIFICATA PER OTTIMIZZAZIONE ---
+def preprocess_and_extract_features(frame, online_targets, frame_log, frame_id, last_feature_extraction_frame, last_known_aus):
+    """Estrae feature solo per i volti che ne hanno bisogno in questo frame."""
     start_time = time.time()
     faces_data = []
+    faces_to_process_fully = []
+
     for track in online_targets:
         if not track.is_activated or track.state == TrackState.Lost:
             continue
         
         x1, y1, w_box, h_box = map(int, track.tlwh)
         x2, y2 = x1 + w_box, y1 + h_box
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
+        x1, y1, x2, y2 = max(0, x1), max(0, y1), min(frame.shape[1], x2), min(frame.shape[0], y2)
         
         face_cropped = frame[y1:y2, x1:x2]
-        if face_cropped.size == 0:
-            continue
+        if face_cropped.size == 0: continue
         
         face_resized = cv2.resize(face_cropped, CLIP_SIZE)
         face_rgb = cv2.cvtColor(face_resized, cv2.COLOR_BGR2RGB)
         
-        faces_data.append({
-            "track_id": track.track_id,
-            "face_rgb": face_rgb,
-            "bbox": (x1, y1, x2, y2),
-            "original_bbox_dims": (w_box, h_box)
-        })
+        track_id = track.track_id
+        current_face_data = {"track_id": track_id, "face_rgb": face_rgb, "bbox": (x1, y1, x2, y2), "original_bbox_dims": (w_box, h_box)}
+        faces_data.append(current_face_data)
+
+        # Logica di "salto": processa solo se sono passati N frame
+        if frame_id >= last_feature_extraction_frame.get(track_id, -1) + FEATURE_EXTRACTION_SKIP:
+            faces_to_process_fully.append(current_face_data)
+            last_feature_extraction_frame[track_id] = frame_id
     
     frame_log["face_preprocessing_time"] = time.time() - start_time
     au_results_map = {}
-    if faces_data:
+    if faces_to_process_fully:
         start_au_time = time.time()
-        faces_rgb_batch = [data["face_rgb"] for data in faces_data]
+        faces_rgb_batch = [data["face_rgb"] for data in faces_to_process_fully]
         batched_aus = get_au_from_face_ndarray(faces_rgb_batch)
-        for i, data in enumerate(faces_data):
+        for i, data in enumerate(faces_to_process_fully):
+            # Aggiorna la mappa dei risultati e l'ultimo AU conosciuto per questa traccia
             au_results_map[data["track_id"]] = batched_aus[i]
+            last_known_aus[data["track_id"]] = batched_aus[i]
         frame_log["au_extraction_time"] = time.time() - start_au_time
     else:
         frame_log["au_extraction_time"] = 0.0
 
     frame_log["num_faces"] = len(faces_data)
-    return faces_data, au_results_map
+    # faces_data contiene tutti i volti del frame corrente
+    # faces_to_process_fully contiene solo quelli da dare a MediaPipe
+    return faces_data, faces_to_process_fully, au_results_map
+
 
 def submit_tasks_to_executor(faces_data, au_results_map, executor):
     """Submits FaceMesh analysis tasks to the thread pool executor."""
@@ -358,17 +267,15 @@ def submit_tasks_to_executor(faces_data, au_results_map, executor):
     for face_data in faces_data:
         future = executor.submit(_process_face_mesh_for_thread, face_data["face_rgb"])
         new_futures.append({
-            "future": future,
-            "track_id": face_data["track_id"],
-            "face_rgb": face_data["face_rgb"],
-            "bbox": face_data["bbox"],
+            "future": future, "track_id": face_data["track_id"],
+            "face_rgb": face_data["face_rgb"], "bbox": face_data["bbox"],
             "original_bbox_dims": face_data["original_bbox_dims"],
             "aus_pred": au_results_map.get(face_data["track_id"])
         })
     return new_futures
 
 def collect_completed_futures(active_futures):
-    """Checks for completed futures, collects their results, and returns them."""
+    # ... (invariata)
     completed_results, remaining_futures = [], []
     for task in active_futures:
         if task["future"].done():
@@ -384,50 +291,55 @@ def collect_completed_futures(active_futures):
             remaining_futures.append(task)
     return completed_results, remaining_futures
 
+# --- FUNZIONE MODIFICATA PER GESTIRE I BUCHI NEI DATI ---
 def handle_clip_buffers(result, clip_buffer, au_buffer, land_buffer, frame_id, clips_in_ram,
-                        video_clip_logs, track_clip_counters, current_source_name):
-    """Manages buffering and saving/storing of clips for each tracked face."""
+                        video_clip_logs, track_clip_counters, current_source_name, video_path, last_known_data):
+    """Gestisce i buffer, riempiendo i buchi con gli ultimi dati validi."""
     track_id = result["track_id"]
+    
+    # Inizializza i buffer e l'ultimo dato noto se non esistono
     for buffer in [clip_buffer, au_buffer, land_buffer]:
         buffer.setdefault(track_id, [])
+    last_known_data.setdefault(track_id, {"aus": None, "landmarks": None})
 
+    # Aggiungi i dati correnti
     clip_buffer[track_id].append(result["face_rgb"])
-    au_buffer[track_id].append(result["aus_pred"])
-    land_buffer[track_id].append(result["face_landmarks"])
+    
+    # Se abbiamo nuovi dati, aggiorna l'ultimo noto e aggiungili
+    if result.get("aus_pred") is not None:
+        last_known_data[track_id]["aus"] = result["aus_pred"]
+    au_buffer[track_id].append(last_known_data[track_id]["aus"])
 
-    if (len(clip_buffer[track_id]) >= CLIP_LENGTH and
-        len(au_buffer[track_id]) >= AU_CLIP_LENGTH and
-        len(land_buffer[track_id]) >= LAND_CLIP_LENGTH):
+    if result.get("face_landmarks") is not None:
+        last_known_data[track_id]["landmarks"] = result["face_landmarks"]
+    land_buffer[track_id].append(last_known_data[track_id]["landmarks"])
+    
+    # Controlla se abbiamo abbastanza dati per creare un clip
+    if (len(clip_buffer[track_id]) >= CLIP_LENGTH):
+        # Rimuovi i None all'inizio se il buffer non è ancora pieno di dati reali
+        au_sequence = [item for item in au_buffer[track_id][:CLIP_LENGTH] if item is not None]
+        land_sequence = [item for item in land_buffer[track_id][:CLIP_LENGTH] if item is not None]
+        
+        # Procedi solo se abbiamo abbastanza dati validi dopo il filtraggio
+        if len(au_sequence) >= AU_CLIP_LENGTH and len(land_sequence) >= LAND_CLIP_LENGTH:
+            clip_data = np.stack(clip_buffer[track_id][:CLIP_LENGTH])
 
-        clip_data = np.stack(clip_buffer[track_id][:CLIP_LENGTH])
-        au_sequence = au_buffer[track_id][:AU_CLIP_LENGTH]
-        land_sequence = land_buffer[track_id][:LAND_CLIP_LENGTH]
-
-        if args.mode == "memory":
-            images_tensor = torch.tensor(clip_data, dtype=torch.float32).permute(0, 3, 1, 2) / 255.0
-            # Further processing for AU/Landmark tensors can be done here if needed
-            clips_in_ram.append({"track_id": track_id, "images": images_tensor})
-        # Dentro handle_clip_buffers, al posto della chiamata a save_clip_data
-        elif args.mode == "save":
-            track_clip_counters.setdefault(track_id, 0)
-            clip_idx = track_clip_counters[track_id]
+            if args.mode == "save":
+                track_clip_counters.setdefault(track_id, 0)
+                clip_idx = track_clip_counters[track_id]
+                clip_task = (
+                    current_source_name, track_id, clip_idx,
+                    clip_data, land_sequence, au_sequence,
+                    frame_id - CLIP_LENGTH + 1, frame_id, video_path
+                )
+                clip_writer_queue.put(clip_task)
+                track_clip_counters[track_id] += 1
             
-            # Prepara i dati per il thread writer
-            clip_task = (
-                current_source_name, track_id, clip_idx,
-                clip_data, land_sequence, au_sequence,
-                frame_id - CLIP_LENGTH + 1, frame_id,
-                video_path # Passa il percorso completo del video
-            )
-            # Metti il task nella coda invece di bloccare il ciclo
-            clip_writer_queue.put(clip_task)
+            # Fai scorrere i buffer
+            clip_buffer[track_id] = clip_buffer[track_id][CLIP_STEP:]
+            au_buffer[track_id] = au_buffer[track_id][AU_CLIP_STEP:]
+            land_buffer[track_id] = land_buffer[track_id][LAND_CLIP_STEP:]
 
-            track_clip_counters[track_id] += 1
-
-        # Slide the buffers
-        clip_buffer[track_id] = clip_buffer[track_id][CLIP_STEP:]
-        au_buffer[track_id] = au_buffer[track_id][AU_CLIP_STEP:]
-        land_buffer[track_id] = land_buffer[track_id][LAND_CLIP_STEP:]
 
 def draw_visualizations(frame, tracked_faces, mesh_results, img_w, img_h, frame_log, frame_id):
     """Annota bounding box, ID e landmark sul frame, compatibile con modalità headless."""
@@ -437,8 +349,7 @@ def draw_visualizations(frame, tracked_faces, mesh_results, img_w, img_h, frame_
         x1, y1, x2, y2 = face["bbox"]
         track_id = face["track_id"]
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        cv2.putText(frame, f"ID: {track_id}", (x1, y1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (36, 255, 12), 1)
+        cv2.putText(frame, f"ID: {track_id}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (36, 255, 12), 1)
 
     for mp_data in mesh_results:
         face_landmarks = mp_data["face_landmarks"]
@@ -512,21 +423,29 @@ def draw_visualizations(frame, tracked_faces, mesh_results, img_w, img_h, frame_
 
 
 def cleanup():
-    if cleanup_called.is_set():
-        return
+    if cleanup_called.is_set(): return
     cleanup_called.set()
-
     print("\n[INFO] Esecuzione cleanup finale...")
+
     if "executor" in globals() and executor is not None:
         try:
             executor.shutdown(wait=True)
-            stop_writer_thread.set()
-            clip_writer_queue.join() # Attende che la coda sia vuota
-            writer_thread.join() # Attende che il thread termini
+            print("[INFO] ThreadPoolExecutor (MediaPipe) terminato.")
         except Exception as e:
-            print(f"[WARN] Errore durante lo shutdown del thread pool: {e}")
+            print(f"[WARN] Errore durante lo shutdown del ThreadPoolExecutor: {e}")
+    
+    # Gestisci il writer thread separatamente e sempre
+    if "writer_thread" in globals() and writer_thread.is_alive():
+        print("[INFO] In attesa del completamento del thread writer...")
+        stop_writer_thread.set()
+        # Non usare .join() sulla coda, può bloccare all'infinito se il thread è in attesa
+        writer_thread.join(timeout=10) # Dai un timeout per sicurezza
+        if writer_thread.is_alive():
+            print("[WARN] Il thread writer non è terminato entro 10 secondi.")
+        else:
+            print("[INFO] Thread writer completato.")
 
-
+    # Il resto della logica per salvare i log
     if all_clip_logs:
         clips_df = pd.DataFrame(all_clip_logs)
         master_log_path = os.path.join(OUTPUT_BASE_DIR, "master_clip_log.csv")
@@ -570,6 +489,7 @@ def cleanup():
     if not args.headless:
         cv2.destroyAllWindows()
     print("[INFO] Cleanup completato.")
+
 
 atexit.register(cleanup)
 
@@ -629,30 +549,23 @@ if __name__ == "__main__" :
         try:
             libreface_init_au_model()
             print("LibreFace AU model loaded.")
-            #print(f"[DEBUG] args.headless = {args.headless}")
-            #print(f"[DEBUG] args.vis = {args.vis}")
-            #print(f"[DEBUG] args.backend_target = {args.backend_target}")
-
         except Exception as e:
             print(f"ERROR: Failed to initialize LibreFace AU model: {e}"); sys.exit(1)
-
+    
     backend_id, target_id = backend_target_pairs[args.backend_target]
     face_detector = YuNet(modelPath=args.model, inputSize=[640, 480], confThreshold=0.9, nmsThreshold=0.3, topK=500, backendId=backend_id, targetId=target_id)
     mp_face_mesh = mp.solutions.face_mesh
     mp_drawing = mp.solutions.drawing_utils
     mp_drawing_styles = mp.solutions.drawing_styles
     executor = ThreadPoolExecutor(max_workers=args.num_workers_per_frame)
-
+    
+    all_pipeline_logs = []
     progress_bar = None
-
-
+    
     try:
-    # --- Main Loop over Videos ---
         for video_path in video_paths:
-            if esc_pressed.is_set():
-                print("ESC detected before starting next video. Exiting...")
-                break
-
+            if esc_pressed.is_set(): break
+            
             source_name = "webcam" if video_path == '0' else os.path.basename(video_path)
 
             # Reset del contatore ID tracking se disponibile
@@ -707,7 +620,10 @@ if __name__ == "__main__" :
             track_clip_counters = {}
             pipeline_logs_for_this_video, video_clip_logs, clips_in_ram = [], [], []
 
-
+            last_feature_extraction_frame = {}
+            last_known_aus = {}
+            last_known_landmarks = {}
+            last_known_data_for_clip = {}
 
             # Tentativo di calcolo del numero totale di frame (può fallire in streaming)
             try:
@@ -722,27 +638,28 @@ if __name__ == "__main__" :
 
             try:
                 while cap.isOpened():
+                    if esc_pressed.is_set(): raise InterruptedError("ESC pressed.")
                     
                     start_total_frame_time = time.time()
                     frame_log = {"frame_id": frame_id, "source_name": source_name, "clip_handling_time": 0.0}
-
-                    start_read_time = time.time()
-                    ret, frame = cap.read() 
-                    if not ret:
-                        break
-                    frame_log["read_frame_time"] = time.time() - start_read_time
+                    
+                    ret, frame = cap.read()
+                    if not ret: break
+                    frame_log["read_frame_time"] = time.time() - start_total_frame_time
 
                     if frame_id % args.frame_skip != 0:
                         frame_id += 1
                         continue
 
-
                     online_targets, img_h, img_w = detect_and_track(frame, face_detector, tracker, yunet_input_size, frame_log)
-                    preprocessed_faces, au_map = preprocess_and_extract_features(frame, online_targets, frame_log)
                     
+                    # --- CHIAMATA ALLA FUNZIONE OTTIMIZZATA ---
+                    all_faces, faces_for_full_process, au_map = preprocess_and_extract_features(
+                        frame, online_targets, frame_log, frame_id, last_feature_extraction_frame, last_known_aus)
+
                     start_mediapipe_wall_time = time.time()
-                    if preprocessed_faces and au_map:
-                        new_tasks = submit_tasks_to_executor(preprocessed_faces, au_map, executor)
+                    if faces_for_full_process:
+                        new_tasks = submit_tasks_to_executor(faces_for_full_process, au_map, executor)
                         active_futures.extend(new_tasks)
                     
                     completed_results, active_futures = collect_completed_futures(active_futures)
@@ -750,10 +667,17 @@ if __name__ == "__main__" :
                     
                     total_mediapipe_thread_time = 0
                     start_clip_time = time.time()
-                    for result in completed_results:
-                        total_mediapipe_thread_time += result["processing_time"]
-                        handle_clip_buffers(result, clip_buffer, au_buffer, land_buffer, frame_id, clips_in_ram,
-                                            video_clip_logs, track_clip_counters, source_name)
+                    
+                    # Mappa i risultati completati per un accesso rapido
+                    results_map = {res["track_id"]: res for res in completed_results}
+                    
+                    for face_data in all_faces:
+                        track_id = face_data["track_id"]
+                        # Prendi il risultato di questo frame se esiste, altrimenti usa i dati base
+                        result_for_buffer = results_map.get(track_id, face_data)
+                        handle_clip_buffers(result_for_buffer, clip_buffer, au_buffer, land_buffer, frame_id, clips_in_ram,
+                                            video_clip_logs, track_clip_counters, source_name, video_path, last_known_data_for_clip)
+
                     frame_log["clip_handling_time"] = time.time() - start_clip_time
                     frame_log["mediapipe_thread_time_sum"] = total_mediapipe_thread_time
 
@@ -764,10 +688,12 @@ if __name__ == "__main__" :
                     pipeline_logs_for_this_video.append(frame_log)
                     
                     start_draw_time = time.time()
-                    draw_visualizations(frame, preprocessed_faces, completed_results, img_w, img_h, frame_log, frame_id) 
+                    draw_visualizations(frame, all_faces, completed_results, img_w, img_h, frame_log, frame_id)
                     frame_log["drawing_time"] = time.time() - start_draw_time  
                     if video_writer:
                         video_writer.write(frame)
+        
+                    frame_id += 1
 
                     if progress_bar:
                         progress_bar.update(1)
@@ -778,25 +704,14 @@ if __name__ == "__main__" :
 
             
             except (KeyboardInterrupt, InterruptedError):
-                print("\nInterruption detected. Proceeding to cleanup and final report generation.")
+                print("\nInterruzione rilevata. Procedo al cleanup...")
             finally:
-                if args.output:
-                    print(f"Finished processing '{source_name}'. Processed {frame_id} frames. Saved output to '{args.output}'")
-                else:
-                    print(f"Finished processing '{source_name}'. Processed {frame_id} frames.")
-
-                cap.release()
-
-                if progress_bar:
-                    progress_bar.close()
-
-                if video_writer:
-                    video_writer.release()
+                if cap.isOpened(): cap.release()
+                if progress_bar: progress_bar.close()
+                if 'video_writer' in locals() and video_writer and video_writer.isOpened(): video_writer.release()
                 BaseTrack._count = 0
-                if not args.headless:
-                    cv2.destroyAllWindows()
                 all_pipeline_logs.extend(pipeline_logs_for_this_video)
-                all_clip_logs.extend(video_clip_logs)
+                # NON estendere i clip logs qui, vengono già aggiunti globalmente dal writer
     finally:
             # --- Final Cleanup and Reporting (after all videos) ---
             cleanup()
