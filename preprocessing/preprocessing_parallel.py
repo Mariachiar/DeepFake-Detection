@@ -620,6 +620,10 @@ if __name__ == "__main__" :
 
             if hasattr(STrack, "_count"):
                 STrack._count = 0
+            if hasattr(BaseTrack, "_count"):
+                BaseTrack._count = 0
+            print("[DEBUG] Contatore track_id azzerato.")
+
 
             cap = cv2.VideoCapture(int(video_path) if video_path == '0' else video_path)
             if not cap.isOpened():
